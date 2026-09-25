@@ -1,93 +1,101 @@
-"use client";
+import { redirect } from "next/navigation";
 
-import { useState } from "react";
-import { CalendarDays, CheckSquare, Mail, StickyNote } from "lucide-react";
+import { AppShell } from "@/components/app-shell";
+import type { PanelKey } from "@/components/sidebar";
+import { getSessionUser } from "@/lib/auth";
+import {
+  getMessages,
+  getMonthEvents,
+  getNotes,
+  getOrCreateThread,
+  getTasks,
+  getThreads,
+  getTodayEvents,
+} from "@/lib/queries";
 
-import { CalendarPanel } from "@/components/calendar-panel";
-import { ChatPanel } from "@/components/chat-panel";
-import { EmailPanel } from "@/components/email-panel";
-import { NotesPanel } from "@/components/notes-panel";
-import { Sidebar, type PanelKey } from "@/components/sidebar";
-import { TasksPanel } from "@/components/tasks-panel";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+// Every panel reads live rows, so this can't be statically rendered.
+export const dynamic = "force-dynamic";
 
-export default function Home() {
-  const [active, setActive] = useState<PanelKey>("chat");
+const PANELS: PanelKey[] = ["chat", "tasks", "calendar", "email", "notes"];
 
-  return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar active={active} onSelect={setActive} />
-
-      <main className="flex min-w-0 flex-1">
-        {active === "chat" ? (
-          <>
-            <section className="flex min-w-0 flex-1 flex-col">
-              <Header
-                title="Chat"
-                subtitle="Not connected to a backend yet"
-              />
-              <ChatPanel />
-            </section>
-
-            <aside className="border-border scrollbar-thin hidden w-80 shrink-0 overflow-y-auto border-l p-4 xl:block">
-              <div className="flex flex-col gap-3">
-                <RailCard title="Today" icon={CalendarDays}>
-                  <CalendarPanel compact />
-                </RailCard>
-                <RailCard title="Due soon" icon={CheckSquare}>
-                  <TasksPanel compact />
-                </RailCard>
-                <RailCard title="Inbox" icon={Mail}>
-                  <EmailPanel compact />
-                </RailCard>
-                <RailCard title="Notes" icon={StickyNote}>
-                  <NotesPanel compact />
-                </RailCard>
-              </div>
-            </aside>
-          </>
-        ) : (
-          <section className="flex min-w-0 flex-1 flex-col">
-            {active === "tasks" && <TasksPanel />}
-            {active === "calendar" && <CalendarPanel />}
-            {active === "email" && <EmailPanel />}
-            {active === "notes" && <NotesPanel />}
-          </section>
-        )}
-      </main>
-    </div>
-  );
-}
-
-function Header({ title, subtitle }: { title: string; subtitle: string }) {
-  return (
-    <div className="border-border flex items-center justify-between border-b px-6 py-3.5">
-      <div>
-        <h1 className="text-sm font-medium tracking-tight">{title}</h1>
-        <p className="text-muted-foreground text-xs">{subtitle}</p>
-      </div>
-    </div>
-  );
-}
-
-function RailCard({
-  title,
-  icon: Icon,
-  children,
+export default async function Home({
+  searchParams,
 }: {
-  title: string;
-  icon: typeof CalendarDays;
-  children: React.ReactNode;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
+  // A database that's down shouldn't render a stack trace — send them to
+  // the login screen, where the failure is reported in context.
+  const user = await getSessionUser().catch((error) => {
+    console.error("[home] session lookup failed", error);
+    return null;
+  });
+
+  if (!user) redirect("/login");
+
+  const params = await searchParams;
+  const asString = (value: string | string[] | undefined) =>
+    Array.isArray(value) ? value[0] : value;
+
+  const threads = await getThreads(user.id);
+
+  // Honour ?thread= only when it belongs to this user.
+  const requested = asString(params.thread);
+  const threadId =
+    (requested && threads.some((thread) => thread.id === requested)
+      ? requested
+      : threads[0]?.id) ?? (await getOrCreateThread(user.id));
+
+  // Today's date in the user's zone, for highlighting the calendar grid.
+  const now = new Date();
+  const localNow = new Date(
+    now.toLocaleString("en-US", { timeZone: user.timezone })
+  );
+  const year = Number(asString(params.y)) || localNow.getFullYear();
+  const month = Number(asString(params.m)) || localNow.getMonth() + 1;
+
+  const safeYear = year >= 1970 && year <= 2200 ? year : localNow.getFullYear();
+  const safeMonth = month >= 1 && month <= 12 ? month : localNow.getMonth() + 1;
+
+  const todayIso = [
+    localNow.getFullYear(),
+    String(localNow.getMonth() + 1).padStart(2, "0"),
+    String(localNow.getDate()).padStart(2, "0"),
+  ].join("-");
+
+  const [events, monthEvents, tasks, notes, history] = await Promise.all([
+    getTodayEvents(user.id),
+    getMonthEvents(user.id, safeYear, safeMonth),
+    getTasks(user.id),
+    getNotes(user.id),
+    getMessages(user.id, threadId),
+  ]);
+
+  const view = asString(params.view);
+  const initialPanel = PANELS.includes(view as PanelKey)
+    ? (view as PanelKey)
+    : "chat";
+
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>
-          <Icon className="text-muted-foreground size-3.5" />
-          {title}
-        </CardTitle>
-      </CardHeader>
-      <CardContent>{children}</CardContent>
-    </Card>
+    <AppShell
+      user={{
+        id: user.id,
+        email: user.email,
+        displayName: user.display_name,
+      }}
+      initialPanel={initialPanel}
+      data={{
+        events,
+        monthEvents,
+        tasks,
+        notes,
+        threads,
+        threadId,
+        history,
+        year: safeYear,
+        month: safeMonth,
+        todayIso,
+        defaultModel: process.env.GEMINI_MODEL ?? "gemini-3.5-flash",
+      }}
+    />
   );
 }

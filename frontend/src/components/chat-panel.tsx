@@ -1,23 +1,53 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, Paperclip, Sparkles } from "lucide-react";
+import { ArrowUp, Sparkles } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { initialMessages, type ChatMessage } from "@/lib/mock-data";
+import type { ChatRow } from "@/lib/queries";
 
 const suggestions = [
   "What's on my plate today?",
-  "Summarize my unread email",
+  "What's my next meeting?",
   "Find a free hour tomorrow",
 ];
 
-export function ChatPanel() {
-  const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
+type Message = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  label: string;
+};
+
+function stamp() {
+  return new Date().toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+export function ChatPanel({
+  threadId,
+  history,
+  model,
+}: {
+  threadId: string;
+  history: ChatRow[];
+  model: string;
+}) {
+  const [messages, setMessages] = useState<Message[]>(() =>
+    history.map((row) => ({
+      id: row.id,
+      role: row.role === "assistant" ? "assistant" : "user",
+      content: row.content,
+      label: row.created_label,
+    }))
+  );
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Switching conversations remounts this component (keyed on threadId in
+  // AppShell), so initial state is always the right thread's history.
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -26,41 +56,86 @@ export function ChatPanel() {
     });
   }, [messages, thinking]);
 
-  function send(text: string) {
+  async function send(text: string) {
     const trimmed = text.trim();
     if (!trimmed || thinking) return;
 
-    const userMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: trimmed,
-      createdAt: new Date().toLocaleTimeString([], {
-        hour: "numeric",
-        minute: "2-digit",
-      }),
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: trimmed,
+        label: stamp(),
+      },
+    ]);
     setInput("");
     setThinking(true);
 
-    // Placeholder until the .NET backend is wired up.
-    setTimeout(() => {
+    const replyId = crypto.randomUUID();
+    let opened = false;
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Only the new turn — the server reads history from the database.
+        body: JSON.stringify({ message: trimmed, threadId, model }),
+      });
+
+      if (!response.ok || !response.body) {
+        const detail = await response.json().catch(() => null);
+        throw new Error(detail?.error ?? `Request failed (${response.status})`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const delta = decoder.decode(value, { stream: true });
+        if (!delta) continue;
+
+        if (!opened) {
+          opened = true;
+          setThinking(false);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: replyId,
+              role: "assistant",
+              content: delta,
+              label: stamp(),
+            },
+          ]);
+          continue;
+        }
+
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === replyId
+              ? { ...message, content: message.content + delta }
+              : message
+          )
+        );
+      }
+    } catch (error) {
+      const detail =
+        error instanceof Error ? error.message : "Something went wrong.";
       setMessages((prev) => [
         ...prev,
         {
           id: crypto.randomUUID(),
           role: "assistant",
-          content:
-            "I'm not connected to a backend yet — once the .NET API is running I'll answer this for real.",
-          createdAt: new Date().toLocaleTimeString([], {
-            hour: "numeric",
-            minute: "2-digit",
-          }),
+          content: `I couldn't reach the model. ${detail}`,
+          label: stamp(),
         },
       ]);
+    } finally {
       setThinking(false);
-    }, 900);
+    }
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -77,6 +152,11 @@ export function ChatPanel() {
         className="scrollbar-thin flex-1 overflow-y-auto px-6 py-6"
       >
         <div className="mx-auto flex max-w-2xl flex-col gap-5">
+          {messages.length === 0 && !thinking && (
+            <p className="text-muted-foreground py-10 text-center text-sm">
+              Ask Pixi anything to get started.
+            </p>
+          )}
           {messages.map((message) => (
             <MessageBubble key={message.id} message={message} />
           ))}
@@ -102,7 +182,6 @@ export function ChatPanel() {
 
           <div className="bg-card border-border focus-within:border-primary/50 rounded-xl border transition-colors">
             <textarea
-              ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -110,10 +189,7 @@ export function ChatPanel() {
               placeholder="Ask Pixi anything..."
               className="placeholder:text-muted-foreground max-h-40 min-h-[3rem] w-full resize-none bg-transparent px-4 py-3.5 text-sm outline-none"
             />
-            <div className="flex items-center justify-between px-2.5 pb-2.5">
-              <Button variant="ghost" size="icon-sm" aria-label="Attach file">
-                <Paperclip />
-              </Button>
+            <div className="flex items-center justify-end px-2.5 pb-2.5">
               <Button
                 size="icon-sm"
                 onClick={() => send(input)}
@@ -130,10 +206,8 @@ export function ChatPanel() {
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
-  const isUser = message.role === "user";
-
-  if (isUser) {
+function MessageBubble({ message }: { message: Message }) {
+  if (message.role === "user") {
     return (
       <div className="flex justify-end">
         <div className="bg-secondary max-w-[80%] rounded-2xl rounded-br-md px-4 py-2.5">
@@ -155,7 +229,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           {message.content}
         </p>
         <span className="text-muted-foreground mt-1.5 block text-[0.7rem]">
-          {message.createdAt}
+          {message.label}
         </span>
       </div>
     </div>
